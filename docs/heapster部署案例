@@ -1,0 +1,167 @@
+注：本案例在我的部署环境下是可行的，但不保证在所有环境下都可行。我尽可能讲得直白而详细，因为我自己也才刚开始接触，已经做过深入研究的可以浏览，若有什么错误，烦请指正，感激不尽！
+
+我的环境：
+K8S1.0.0+flannel+docker1.6的分布式集群。
+
+这里先不赘述flannel的部署了，以后有时间再写相关的文档。
+
+先讲讲kubernetes的serviceaccount，serviceaccount就是一个‘账户’的意思，我们的服务有时候需要一些带有隐私信息的东西，token，certification file等等，这些东西我们可以在master上创建，然后在创建pod的时候导入进去。具体可以去看github上的secret.md，那里有具体的例子。
+
+我们执行：
+kubectl get serviceaccount
+如果如下：
+NAME      SECRETS
+default   1
+那么是正常的（用脚本启动的kubernetes一般会是这样的情况）
+而如果是：
+NAME      SECRETS
+default   0
+这就麻烦了，用脚本启动k8s，启动的时候是会自动创建一个serviceaccount的，而serviceaccount创建出来的时候又会自动创建一个secret作为这个serviceaccount的token。
+
+如果出现了第二种情况，就需要在启动kube-apiserver时增加flag
+--service_account_lookup=false --admission_control=ServiceAccount 
+以及：
+--service-account-key-file="": File containing PEM-encoded x509 RSA private or public key, used to verify ServiceAccount tokens. If unspecified, --tls-private-key-file is used.
+我们后面会用到另一个flag：--tls-private-key-file代替，所以service-account-key-file这个参数在后面可以不用，但这里要用。我们要先创建一个文件，由service-account-key-file指向这个文件。
+我们创建的是一个.key文件，如果我们用sh脚本启动了k8s，脚本会先生成这个.key文件（以及其他一些认证文件，在 /var/run/kubernetes/中），启动时就可以指定了，但是如果我们用二进制文件+flag的方式启动，就要手动去做这些活了。
+
+我们用openssl随意生成一个key：
+openssl genrsa -out server.key 2048
+放入目录（这里最好放在 /var/run/kubernetes/中，因为官方的启动脚本里也是放在这）
+
+kube-apiserver加入flag --service-account-key-file="/var/run/kubernetes/"
+kube-controller-manager 加入flag  --service_account_private_key_file=/var/run/kubernetes/server.key（这个地方我不确定是否必须加这个参数，有心人可以验证一下）
+
+这样启动k8smaster后，我们就会发现
+kubectl get serviceaccount
+结果如下：
+NAME      SECRETS
+default   1
+
+如果我们在这种状态下创建pod，pod中会加入serviceaccount这个字段，即便我们在创建的json或yaml中不指定，那么它的默认值也会是默认的serviceaccount：default。
+而这个serviceaccount的secret就会被导入到pod启动的containers中。
+举个例子，我们在这种状态下创建一个pod，然后
+[root@vm-56-65 bin]# kubectl  get pods/imgpod -o yaml
+在yaml中会发现：
+spec:
+  containers:
+  - image: registry.hub.gome.com.cn/img_server:1.1
+    imagePullPolicy: IfNotPresent
+    name: imgpod
+    resources:
+      limits:
+        cpu: 600m
+        memory: 1181116006400m
+    terminationMessagePath: /dev/termination-log
+    volumeMounts:
+    - mountPath: /var/run/secrets/kubernetes.io/serviceaccount
+      name: default-token-n0i1i
+      readOnly: true
+  dnsPolicy: ClusterFirst
+  nodeName: 10.58.56.62
+  restartPolicy: Always
+  serviceAccountName: default
+  volumes:
+  - name: default-token-n0i1i
+    secret:
+      secretName: default-token-n0i1i
+      
+有了serviceaccountName字段，并且volumn装载了一个secret.是的这个secret：default-token-n0i1i就是我们default这个serviceaccount下的secret。它被装载到mountPath: /var/run/secrets/kubernetes.io/serviceaccount目录中，我们如果在slaver上进入相关容器，便可以找到这个目录和token（注：创建这个pod的json中不用指定serviceaccount，也不用写volumn字段去挂载secret，这些都会自动完成的，是否可以手动指定呢？期待大神们的指点）。
+
+为什么要先说这些呢？ 因为我们的heapster启动的时候会有这种情况：
+pod状态为running，但是反复地restart；我们用webapi查看该pod的日志，发现：
+/var/run/secret/kubernetes.io/serviceaccount/token no such file or directory
+
+这是因为heapster在运行时需要向k8smaster做https的连接，但是没有token和证书是不能连接的，heapster的程序找不到token就error并exit了，k8s会再启动之，于是就反复restart。
+
+
+
+如下是我heapster启动的json（一个replicationcontroller）
+heaprep.json:
+{
+    "apiVersion": "v1",
+    "kind": "ReplicationController",
+    "metadata": {
+        "labels": {
+            "name": "heapster"
+        },
+        "name": "monitoring-heapster-controller"
+    },
+    "spec": {
+        "replicas": 1,
+        "selector": {
+            "name": "heapster"
+        },
+        "template": {
+            "metadata": {
+                "labels": {
+                    "name": "heapster"
+                }
+            },
+            "spec": {
+                "containers": [
+                    {
+                        "image": "registry.hub.gome.com.cn/kubernetes/heapster:v0.16.0",
+                        "name": "heapster",
+			"command":[
+				"/heapster",
+				"--source=kubernetes:'https://kubernetes:443?auth='",
+				"--sink=influxdb:http://10.126.53.10:8086"
+			],
+			"resources": {
+                		"limits":{
+                        	"cpu":"0.5",
+                        	"memory":"1.1Gi"
+                		}
+        		},
+			 "env": [
+              {
+                "name": "KUBERNETES_SERVICE_HOST",
+                "value": "vm-56-65"
+              }
+            ]
+                    }
+                ]
+            }
+        }
+    }
+}
+
+这里"env"中的环境变量是必须要加的，否则heapster会报错，具体什么错不大记得了，应该是有关10.0.0.1 这个域名的（heapster中的KUBERNETES_SERVICE_HOST变量默认是10.0.0.1:443）。
+10.0.0.1是k8s集群中master服务的ClusterIP（kubectl get svc 就可以看到）,其他slaver是可以通过这个ip：port访问到master服务的。但是因为heapster做的是https的请求，需要crt证书和token。而10.0.0.1不是一个hostname并且没有相关的证书（感觉这是heapster最大的一个坑），所以我干脆自己做证书，自己做hosts引导，自己做环境变量。
+
+
+现在我们需要一个hostname为vm-56-65的证书：
+openssl genrsa -out ca.key 2048
+
+openssl req -x509 -new -nodes -key ca.key -subj "/CN=vm-56-65" -days 5000 -out ca.crt
+
+openssl genrsa -out server.key 2048
+
+openssl req -new -key server.key -subj "/CN=vm-56-65" -out server.csr
+
+openssl x509 -req -in server.csr -CA ca.crt -CAkey ca.key -CAcreateserial -out server.crt -days 5000
+
+注意，这里两个 -subj "***"要写hostname。具体关于证书的生成，可以参考：
+http://wangzhezhe.github.io/blog/2015/08/05/httpsandgolang/
+执行这些命令后，会生成一系列文件，将它们一并copy到master的/var/run/kubernetes/中，我们的master启动要用这些证书文件：
+
+./kube-apiserver --logtostderr=true --log-dir=/var/log/ --v=0   --service_account_lookup=false --admission_control=NamespaceLifecycle,NamespaceAutoProvision,LimitRanger,SecurityContextDeny,ServiceAccount,ResourceQuota   --etcd_servers=http://127.0.0.1:4001 --insecure_bind_address=0.0.0.0 --insecure_port=8080 --kubelet_port=10250 --service-cluster-ip-range=10.0.0.1/24 --allow_privileged=false   --service-node-port-range='30000-35535'   --secure-port=443    --client_ca_file=/var/run/kubernetes/ca.crt  --tls-private-key-file=/var/run/kubernetes/server.key --tls-cert-file=/var/run/kubernetes/server.crt 
+*前文提到的service-account-key-file 这里就不用了:)
+
+这里--secure-port=443 是因为我在heapster访问master时，没有采用内部ClusterIP，而是直接访问物理IP，而端口没有变，所以将master上apiserver的https监听端口修改了以便访问。
+
+这样启动了apiserver后，我们再重新create pod。
+容器启动，我们进入pod的日志，看到非常多的：
+dial tcp: lookup vm-56-65: no such host
+
+
+进入容器中修改容器里的/etc/hosts，这里我就不细讲怎么搞了，大家都懂的~
+
+修改完毕后，再刷新几次pod的日志，会发现，日志慢慢就不更新了（或者该说，不报错了），恭喜你，heapster已经在正常跑了。
+
+heapster最大的好处是其抓取的监控数据可以按pod，container，namespace等方式group，这样就能进行监控信息的隐私化，即每个k8s的用户只能看到自己的应用的资源使用情况，而后台管理者又能看到每台机器的资源使用情况，类似自动扩容之类的功能就有了一个可靠的信息来源。
+
+以上只是我个人在部署过程中遇到的问题，相信heapster还有很多的坑，大家多多交流吧~^_^
+
+
