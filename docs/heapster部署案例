@@ -156,7 +156,12 @@ http://wangzhezhe.github.io/blog/2015/08/05/httpsandgolang/
 dial tcp: lookup vm-56-65: no such host
 
 
-进入容器中修改容器里的/etc/hosts，这里我就不细讲怎么搞了，大家都懂的~
+进入容器中修改容器里的/etc/hosts，
+可以写
+10.58.56.65 vm-56-65
+也可以写
+10.0.0.1 vm-56-65   因为这个是kubernetes service的clusterIP
+这里我就不细讲怎么搞了，大家都懂的~
 
 修改完毕后，再刷新几次pod的日志，会发现，日志慢慢就不更新了（或者该说，不报错了），恭喜你，heapster已经在正常跑了。
 
